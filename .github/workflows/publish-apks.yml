@@ -2,11 +2,7 @@ name: Publish APKs to Releases & Update README
 
 on:
   push:
-    branches: [ main ]
-    paths:
-      - 'apk/**'
-      - 'publish_apks.py'
-      - 'README.md'
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -18,6 +14,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -34,7 +32,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md .apk_store_state.json apk/
-          git commit -m "chore: publish APK release assets and update README.md" || exit 0
+          git pull --rebase --autostash || true
+          git add -A
+          git diff --staged --quiet || git commit -m "chore: publish APK release assets and update README.md"
           git push
           

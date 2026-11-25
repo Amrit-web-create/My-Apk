@@ -39,7 +39,6 @@ def api_request(method: str, url: str, token: str, data: bytes | None = None, co
 
 
 def upload_release_asset(upload_url_template: str, token: str, apk_path: Path) -> str:
-    # upload_url looks like: https://uploads.github.com/repos/owner/repo/releases/123/assets{?name,label}
     base_upload_url = upload_url_template.split("{", 1)[0]
     asset_name = apk_path.name
     url = f"{base_upload_url}?name={asset_name}"
@@ -59,7 +58,6 @@ def upload_release_asset(upload_url_template: str, token: str, apk_path: Path) -
             payload = json.loads(resp.read().decode("utf-8"))
             return payload["browser_download_url"]
     except HTTPError as exc:
-        # Agar same asset name pehle se exist karta hai (HTTP 422), toh release assets se purana delete karke dobara upload karein
         body = exc.read().decode("utf-8", errors="replace")
         if exc.code == 422:
             release_id = base_upload_url.rstrip("/").split("/")[-2]
@@ -105,30 +103,37 @@ def default_title_from_filename(filename: str) -> str:
     return readable.title() if readable else "App"
 
 
+def clean_bold_text(text: str) -> str:
+    # Leading/trailing ** ya * hata kar clean plain text nikalta hai, phir render karte waqt hamesha **text** lagaya jayega
+    s = text.strip()
+    s = re.sub(r"^\*+|\*+$", "", s).strip()
+    return s
+
+
 def parse_existing_readme_overrides(readme_text: str) -> dict[str, dict[str, str]]:
-    """
-    Agar user ne README ke table/list me kisi URL ke saath apna custom Name ya Version likha hai,
-    toh usko nikal kar return karega: { download_url: {"name": ..., "version": ...} }
-    """
     overrides: dict[str, dict[str, str]] = {}
     if START_MARKER not in readme_text or END_MARKER not in readme_text:
         return overrides
 
     block = readme_text.split(START_MARKER, 1)[1].split(END_MARKER, 1)[0]
     for line in block.splitlines():
-        url_match = re.search(r"(https://github\.com/[^\s\)\]>]+?\.apk)", line)
+        url_match = re.search(r"(https://github\.com/[^\s\)\]`|]+?\.apk)", line)
         if not url_match:
             continue
         url = url_match.group(1)
 
-        # Markdown table row format: | **Name** | `1.0` | [Download APK](url) |
         if line.strip().startswith("|"):
             cols = [c.strip() for c in line.strip().strip("|").split("|")]
             if len(cols) >= 2:
-                raw_name = re.sub(r"^\*\*|\*\*$", "", cols[0]).strip()
+                raw_name = clean_bold_text(cols[0])
                 raw_ver = re.sub(r"^`|`$", "", cols[1]).strip()
-                if raw_name and raw_ver:
-                    overrides[url] = {"name": raw_name, "version": raw_ver}
+                entry: dict[str, str] = {}
+                if raw_name and raw_name != "*No APKs published yet*":
+                    entry["name"] = raw_name
+                if raw_ver and raw_ver != "-":
+                    entry["version"] = raw_ver
+                if entry:
+                    overrides[url] = entry
     return overrides
 
 
@@ -141,7 +146,6 @@ def extract_apks_from_folder() -> list[Path]:
     EXTRACT_TMP_DIR.mkdir(parents=True, exist_ok=True)
     found_apks: list[Path] = []
 
-    # 1. Direct .apk files in apk/
     for p in sorted(APK_DIR.rglob("*.apk")):
         if p.is_file():
             dest = EXTRACT_TMP_DIR / p.name
@@ -149,7 +153,6 @@ def extract_apks_from_folder() -> list[Path]:
             found_apks.append(dest)
             p.unlink(missing_ok=True)
 
-    # 2. Extract .apk from any .zip files in apk/ (release me zip upload nahi hoga)
     for zp in sorted(APK_DIR.rglob("*.zip")):
         if not zp.is_file():
             continue
@@ -176,7 +179,6 @@ def extract_apks_from_folder() -> list[Path]:
         except zipfile.BadZipFile:
             print(f"[SKIP INVALID ZIP] {zp}")
         finally:
-            # Zip ko apk/ se hata dein taaki dobara process na ho aur release me na jaye
             zp.unlink(missing_ok=True)
 
     return found_apks
@@ -208,21 +210,26 @@ def update_readme(apps: list[dict]) -> None:
         START_MARKER,
         "## Available APKs",
         "",
-        "| App Name | Version | Direct APK Download |",
-        "| :--- | :---: | :--- |",
+        "| App Name | Version | Download | Copy Link |",
+        "| :--- | :---: | :--- | :--- |",
     ]
 
     if not apps:
-        lines.append("| *No APKs published yet* | `-` | *Upload `.apk` or `.zip` into `apk/` folder* |")
+        lines.append("| ***No APKs published yet*** | `-` | *Upload `.apk` or `.zip` into `apk/`* | `-` |")
     else:
         for item in apps:
             url = item["download_url"]
             ov = overrides.get(url, {})
-            app_name = ov.get("name") or item["name"]
+            raw_name = ov.get("name") or item["name"]
+            app_name = clean_bold_text(raw_name) or "App"
             version = ov.get("version") or item.get("version") or "1.0"
             item["name"] = app_name
             item["version"] = version
-            lines.append(f"| **{app_name}** | `{version}` | [Download APK]({url}) |")
+
+            # App name hamesha **bold** rahega; Download link + quick-copy inline URL block
+            lines.append(
+                f"| **{app_name}** | `{version}` | [Download APK]({url}) | `{url}` |"
+            )
 
     lines.append("")
     lines.append(END_MARKER)
@@ -257,7 +264,6 @@ def main() -> int:
         print("Error: GITHUB_TOKEN and GITHUB_REPOSITORY environment variables are required.", file=sys.stderr)
         return 1
 
-    # Always ensure apk/ folder exists
     APK_DIR.mkdir(parents=True, exist_ok=True)
     if not (APK_DIR / ".gitkeep").exists():
         (APK_DIR / ".gitkeep").write_text("", encoding="utf-8")
@@ -288,7 +294,7 @@ def main() -> int:
                     "version": "1.0",
                     "asset_name": apk_path.name,
                     "download_url": download_url,
-                }
+    }
                 apps.append(entry)
                 existing_by_url[download_url] = entry
     finally:
@@ -302,4 +308,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-              

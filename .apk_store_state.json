@@ -4,5 +4,11 @@
     "version": "1.0",
     "asset_name": "app-release.apk",
     "download_url": "https://github.com/Amrit-web-create/My-Apk/releases/download/apk-app-release/app-release.apk"
+  },
+  {
+    "name": "Sanatanwallpaper Release",
+    "version": "1.0",
+    "asset_name": "SanatanWallpaper-release.apk",
+    "download_url": "https://github.com/Amrit-web-create/My-Apk/releases/download/apk-sanatanwallpaper-release/SanatanWallpaper-release.apk"
   }
 ]

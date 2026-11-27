@@ -45,6 +45,13 @@ def api_request(
         raise RuntimeError(f"Network error on {method} {url}: {exc}") from exc
 
 
+def normalize_asset_name(name: str) -> str:
+    # GitHub asset upload sometimes normalizes spaces to dots
+    p = Path(name)
+    stem = re.sub(r"\s+", ".", p.stem).strip(".")
+    return f"{stem}{p.suffix.lower()}"
+
+
 def upload_release_asset(upload_url_template: str, token: str, apk_path: Path) -> str:
     base_upload_url = upload_url_template.split("{", 1)[0]
     asset_name = apk_path.name
@@ -61,33 +68,37 @@ def upload_release_asset(upload_url_template: str, token: str, apk_path: Path) -
         "User-Agent": "ApkStorePublisher/1.0",
     }
 
-    def _post_asset() -> dict:
-        req = Request(url, data=file_bytes, headers=headers, method="POST")
+    def _post_asset(target_url: str) -> dict:
+        req = Request(target_url, data=file_bytes, headers=headers, method="POST")
         with urlopen(req, timeout=600) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     try:
-        payload = _post_asset()
+        payload = _post_asset(url)
         return payload["browser_download_url"]
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         if exc.code == 422:
-            # Agar same asset name pehle se release me hai, toh delete karke safe retry karein
             parts = base_upload_url.rstrip("/").split("/")
             if "/releases/" in base_upload_url and len(parts) >= 2:
                 release_id = parts[-2]
                 owner_repo_part = base_upload_url.split("/repos/", 1)[1].split("/releases/", 1)[0]
                 assets_url = f"https://api.github.com/repos/{owner_repo_part}/releases/{release_id}/assets"
+                target_norm = normalize_asset_name(asset_name)
+
                 try:
                     assets = api_request("GET", assets_url, token)
                     if isinstance(assets, list):
                         for asset in assets:
-                            if asset.get("name") == asset_name and asset.get("id") is not None:
+                            existing_name = str(asset.get("name") or "")
+                            if (
+                                existing_name == asset_name
+                                or normalize_asset_name(existing_name) == target_norm
+                            ) and asset.get("id") is not None:
                                 del_url = f"{assets_url}/{asset['id']}"
                                 try:
                                     api_request("DELETE", del_url, token)
                                 except RuntimeError as del_exc:
-                                    # 404 aaye toh ignore karein kyunki asset pehle hi hat chuka hai
                                     if "error 404 " not in str(del_exc):
                                         raise
                 except RuntimeError as list_exc:
@@ -95,7 +106,7 @@ def upload_release_asset(upload_url_template: str, token: str, apk_path: Path) -
                         raise
 
             try:
-                payload2 = _post_asset()
+                payload2 = _post_asset(url)
                 return payload2["browser_download_url"]
             except HTTPError as retry_exc:
                 retry_body = retry_exc.read().decode("utf-8", errors="replace")
@@ -178,7 +189,6 @@ def extract_apks_from_folder() -> list[Path]:
     EXTRACT_TMP_DIR.mkdir(parents=True, exist_ok=True)
     found_apks: list[Path] = []
 
-    # Direct .apk files
     for p in sorted(APK_DIR.rglob("*.apk")):
         if p.is_file():
             dest = EXTRACT_TMP_DIR / p.name
@@ -192,7 +202,6 @@ def extract_apks_from_folder() -> list[Path]:
             found_apks.append(dest)
             p.unlink(missing_ok=True)
 
-    # Extract .apk inside .zip files (zip ko release me upload nahi kiya jata)
     for zp in sorted(APK_DIR.rglob("*.zip")):
         if not zp.is_file():
             continue
@@ -347,4 +356,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-        

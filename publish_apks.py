@@ -5,6 +5,7 @@ import sys
 import zipfile
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 APK_DIR = Path("apk")
@@ -16,7 +17,13 @@ START_MARKER = "<!-- APK_STORE_START -->"
 END_MARKER = "<!-- APK_STORE_END -->"
 
 
-def api_request(method: str, url: str, token: str, data: bytes | None = None, content_type: str = "application/json"):
+def api_request(
+    method: str,
+    url: str,
+    token: str,
+    data: bytes | None = None,
+    content_type: str = "application/json",
+):
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -41,7 +48,8 @@ def api_request(method: str, url: str, token: str, data: bytes | None = None, co
 def upload_release_asset(upload_url_template: str, token: str, apk_path: Path) -> str:
     base_upload_url = upload_url_template.split("{", 1)[0]
     asset_name = apk_path.name
-    url = f"{base_upload_url}?name={asset_name}"
+    encoded_name = quote(asset_name, safe="")
+    url = f"{base_upload_url}?name={encoded_name}"
 
     file_bytes = apk_path.read_bytes()
     headers = {
@@ -52,27 +60,52 @@ def upload_release_asset(upload_url_template: str, token: str, apk_path: Path) -
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "ApkStorePublisher/1.0",
     }
-    req = Request(url, data=file_bytes, headers=headers, method="POST")
-    try:
+
+    def _post_asset() -> dict:
+        req = Request(url, data=file_bytes, headers=headers, method="POST")
         with urlopen(req, timeout=600) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-            return payload["browser_download_url"]
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        payload = _post_asset()
+        return payload["browser_download_url"]
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         if exc.code == 422:
-            release_id = base_upload_url.rstrip("/").split("/")[-2]
-            owner_repo_part = base_upload_url.split("/repos/", 1)[1].split("/releases/", 1)[0]
-            assets_url = f"https://api.github.com/repos/{owner_repo_part}/releases/{release_id}/assets"
-            assets = api_request("GET", assets_url, token)
-            for asset in assets:
-                if asset.get("name") == asset_name:
-                    del_url = f"{assets_url}/{asset['id']}"
-                    api_request("DELETE", del_url, token)
-            req_retry = Request(url, data=file_bytes, headers=headers, method="POST")
-            with urlopen(req_retry, timeout=600) as resp2:
-                payload2 = json.loads(resp2.read().decode("utf-8"))
+            # Agar same asset name pehle se release me hai, toh delete karke safe retry karein
+            parts = base_upload_url.rstrip("/").split("/")
+            if "/releases/" in base_upload_url and len(parts) >= 2:
+                release_id = parts[-2]
+                owner_repo_part = base_upload_url.split("/repos/", 1)[1].split("/releases/", 1)[0]
+                assets_url = f"https://api.github.com/repos/{owner_repo_part}/releases/{release_id}/assets"
+                try:
+                    assets = api_request("GET", assets_url, token)
+                    if isinstance(assets, list):
+                        for asset in assets:
+                            if asset.get("name") == asset_name and asset.get("id") is not None:
+                                del_url = f"{assets_url}/{asset['id']}"
+                                try:
+                                    api_request("DELETE", del_url, token)
+                                except RuntimeError as del_exc:
+                                    # 404 aaye toh ignore karein kyunki asset pehle hi hat chuka hai
+                                    if "error 404 " not in str(del_exc):
+                                        raise
+                except RuntimeError as list_exc:
+                    if "error 404 " not in str(list_exc):
+                        raise
+
+            try:
+                payload2 = _post_asset()
                 return payload2["browser_download_url"]
+            except HTTPError as retry_exc:
+                retry_body = retry_exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Asset retry upload failed ({retry_exc.code}): {retry_body}"
+                ) from retry_exc
+
         raise RuntimeError(f"Asset upload failed ({exc.code}): {body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Network error while uploading {asset_name}: {exc}") from exc
 
 
 def get_or_create_release(repo_full_name: str, token: str, tag_name: str, release_title: str) -> dict:
@@ -104,7 +137,6 @@ def default_title_from_filename(filename: str) -> str:
 
 
 def clean_bold_text(text: str) -> str:
-    # Leading/trailing ** ya * hata kar clean plain text nikalta hai, phir render karte waqt hamesha **text** lagaya jayega
     s = text.strip()
     s = re.sub(r"^\*+|\*+$", "", s).strip()
     return s
@@ -128,7 +160,7 @@ def parse_existing_readme_overrides(readme_text: str) -> dict[str, dict[str, str
                 raw_name = clean_bold_text(cols[0])
                 raw_ver = re.sub(r"^`|`$", "", cols[1]).strip()
                 entry: dict[str, str] = {}
-                if raw_name and raw_name != "*No APKs published yet*":
+                if raw_name and raw_name.lower() not in {"*no apks published yet*", "no apks published yet"}:
                     entry["name"] = raw_name
                 if raw_ver and raw_ver != "-":
                     entry["version"] = raw_ver
@@ -146,13 +178,21 @@ def extract_apks_from_folder() -> list[Path]:
     EXTRACT_TMP_DIR.mkdir(parents=True, exist_ok=True)
     found_apks: list[Path] = []
 
+    # Direct .apk files
     for p in sorted(APK_DIR.rglob("*.apk")):
         if p.is_file():
             dest = EXTRACT_TMP_DIR / p.name
+            if dest.exists():
+                stem = Path(p.name).stem
+                idx = 1
+                while (EXTRACT_TMP_DIR / f"{stem}_{idx}.apk").exists():
+                    idx += 1
+                dest = EXTRACT_TMP_DIR / f"{stem}_{idx}.apk"
             dest.write_bytes(p.read_bytes())
             found_apks.append(dest)
             p.unlink(missing_ok=True)
 
+    # Extract .apk inside .zip files (zip ko release me upload nahi kiya jata)
     for zp in sorted(APK_DIR.rglob("*.zip")):
         if not zp.is_file():
             continue
@@ -226,7 +266,6 @@ def update_readme(apps: list[dict]) -> None:
             item["name"] = app_name
             item["version"] = version
 
-            # App name hamesha **bold** rahega; Download link + quick-copy inline URL block
             lines.append(
                 f"| **{app_name}** | `{version}` | [Download APK]({url}) | `{url}` |"
             )
@@ -294,7 +333,7 @@ def main() -> int:
                     "version": "1.0",
                     "asset_name": apk_path.name,
                     "download_url": download_url,
-    }
+                }
                 apps.append(entry)
                 existing_by_url[download_url] = entry
     finally:
@@ -308,3 +347,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+        

@@ -46,7 +46,6 @@ def api_request(
 
 
 def normalize_asset_name(name: str) -> str:
-    # GitHub asset upload sometimes normalizes spaces to dots
     p = Path(name)
     stem = re.sub(r"\s+", ".", p.stem).strip(".")
     return f"{stem}{p.suffix.lower()}"
@@ -134,6 +133,43 @@ def get_or_create_release(repo_full_name: str, token: str, tag_name: str, releas
             "prerelease": False,
         }).encode("utf-8")
         return api_request("POST", f"{api_base}/releases", token, data=body)
+
+
+def sync_existing_releases(repo_full_name: str, token: str, apps: list[dict]) -> list[dict]:
+    """
+    GitHub Releases me pehle se maujood sabhi .apk assets ko fetch karke
+    state list me sync karta hai, taaki koi bhi release README se miss na ho.
+    """
+    api_url = f"https://api.github.com/repos/{repo_full_name}/releases?per_page=100"
+    try:
+        releases = api_request("GET", api_url, token)
+    except RuntimeError as exc:
+        print(f"Warning: Could not list existing releases: {exc}")
+        return apps
+
+    if not isinstance(releases, list):
+        return apps
+
+    by_url = {a["download_url"]: a for a in apps if "download_url" in a}
+    for rel in releases:
+        if rel.get("draft"):
+            continue
+        assets = rel.get("assets") or []
+        for asset in assets:
+            name = str(asset.get("name") or "")
+            dl_url = str(asset.get("browser_download_url") or "")
+            if name.lower().endswith(".apk") and dl_url:
+                if dl_url not in by_url:
+                    title = clean_bold_text(str(rel.get("name") or "")) or default_title_from_filename(name)
+                    entry = {
+                        "name": title,
+                        "version": "1.0",
+                        "asset_name": name,
+                        "download_url": dl_url,
+                    }
+                    apps.append(entry)
+                    by_url[dl_url] = entry
+    return apps
 
 
 def slugify(text: str) -> str:
@@ -259,7 +295,7 @@ def update_readme(apps: list[dict]) -> None:
         START_MARKER,
         "## Available APKs",
         "",
-        "| App Name | Version | Download | Copy Link |",
+        "| App Name | Version | Download | Direct URL (Copy) |",
         "| :--- | :---: | :--- | :--- |",
     ]
 
@@ -348,6 +384,9 @@ def main() -> int:
     finally:
         cleanup_tmp()
 
+    # Pehle se bani releases ko bhi sync karein
+    apps = sync_existing_releases(repo_full_name, token, apps)
+
     update_readme(apps)
     save_state(apps)
     print(f"Processed {len(new_apks)} new APK file(s). Total APKs in store: {len(apps)}")
@@ -356,3 +395,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+        
